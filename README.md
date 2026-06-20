@@ -140,11 +140,39 @@ rotary_emb = RotaryEmbedding(
 )
 ```
 
+## Fused Flash Attention with Rotary
+
+You can also use a fused Flash Attention kernel that computes attention with rotary embeddings in one pass. It automatically falls back to a reference PyTorch implementation (CPU/GPU) if Triton is not available. It easily supports ignoring tokens from rotations (like CLS or register tokens) by explicitly passing `rotary_pos_emb_indices`.
+
+```python
+import torch
+from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch.flash_attn_with_rotary import flash_attn_with_rotary
+
+rotary_emb = RotaryEmbedding(dim = 32)
+freqs = rotary_emb.forward(torch.arange(1024))
+
+q = torch.randn(1, 8, 1026, 64).cuda() # 2 extra tokens (e.g. CLS, register)
+k = torch.randn(1, 8, 1026, 64).cuda()
+v = torch.randn(1, 8, 1026, 64).cuda()
+
+# Indices for the 1024 rotary positions, skipping the first 2 tokens (CLS / register)
+pos_indices = torch.arange(1024).cuda() + 2
+
+# fused flash attention with rotary
+out = flash_attn_with_rotary(
+    q, k, v,
+    rotary_pos_emb = freqs,
+    rotary_pos_emb_indices = pos_indices,
+    is_causal = True
+)
+```
+
 ## Citations
 
 ```bibtex
 @misc{su2021roformer,
-    title   = {RoFormer: Enhanced Transformer with Rotary Position Embedding}, 
+    title   = {RoFormer: Enhanced Transformer with Rotary Position Embedding},
     author  = {Jianlin Su and Yu Lu and Shengfeng Pan and Bo Wen and Yunfeng Liu},
     year    = {2021},
     eprint  = {2104.09864},
