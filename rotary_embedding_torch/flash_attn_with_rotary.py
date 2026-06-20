@@ -34,8 +34,13 @@ def reference_flash_attention(
     is_causal = True
 ):
     device, dtype = q.device, q.dtype
-    *_, seq_len_q, dim = q.shape
-    *_, seq_len_k, _ = k.shape
+    batch, heads_q, seq_len_q, dim = q.shape
+    _, heads_kv, seq_len_k, _ = k.shape
+
+    if heads_q != heads_kv:
+        groups = heads_q // heads_kv
+        k = repeat(k, 'b h n d -> b (h g) n d', g = groups)
+        v = repeat(v, 'b h n d -> b (h g) n d', g = groups)
 
     # attention similarity
 
@@ -103,7 +108,7 @@ if TRITON_AVAILABLE:
         stride_vm, stride_vh, stride_vn, stride_vk,
         stride_cz, stride_ch, stride_cn, stride_ck,
         stride_om, stride_oh, stride_on, stride_ok,
-        batch, heads, N_CTX_Q, N_CTX_K,
+        batch, q_heads, kv_heads, N_CTX_Q, N_CTX_K,
         BLOCK_DMODEL: tl.constexpr,
         ROTARY_DIM: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
@@ -115,12 +120,13 @@ if TRITON_AVAILABLE:
         start_m = tl.program_id(0)
         off_hz = tl.program_id(1)
 
-        off_z = off_hz // heads
-        off_h = off_hz % heads
+        off_z = off_hz // q_heads
+        off_h = off_hz % q_heads
+        off_h_kv = off_h // (q_heads // kv_heads)
 
         q_offset = off_z * stride_qm + off_h * stride_qh
-        k_offset = off_z * stride_km + off_h * stride_kh
-        v_offset = off_z * stride_vm + off_h * stride_vh
+        k_offset = off_z * stride_km + off_h_kv * stride_kh
+        v_offset = off_z * stride_vm + off_h_kv * stride_vh
         c_offset = off_z * stride_cz + off_h * stride_ch
 
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -220,7 +226,7 @@ if TRITON_AVAILABLE:
             triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
         ],
         key=['N_CTX_Q', 'N_CTX_K', 'BLOCK_DMODEL'],
-        reset_to_zero=['DQ']
+        reset_to_zero=['DQ', 'DK', 'DV']
     )
     @triton.jit
     def _flash_rotary_bwd_kernel(
@@ -236,7 +242,7 @@ if TRITON_AVAILABLE:
         stride_cz, stride_ch, stride_cn, stride_ck,
         stride_om, stride_oh, stride_on, stride_ok,
         stride_dom, stride_doh, stride_don, stride_dok,
-        batch, heads, N_CTX_Q, N_CTX_K,
+        batch, q_heads, kv_heads, N_CTX_Q, N_CTX_K,
         BLOCK_DMODEL: tl.constexpr,
         ROTARY_DIM: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
@@ -248,15 +254,16 @@ if TRITON_AVAILABLE:
         start_n = tl.program_id(0)
         off_hz = tl.program_id(1)
 
-        off_z = off_hz // heads
-        off_h = off_hz % heads
+        off_z = off_hz // q_heads
+        off_h = off_hz % q_heads
+        off_h_kv = off_h // (q_heads // kv_heads)
 
         offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
 
         q_offset = off_z * stride_qm + off_h * stride_qh
-        k_offset = off_z * stride_km + off_h * stride_kh
-        v_offset = off_z * stride_vm + off_h * stride_vh
+        k_offset = off_z * stride_km + off_h_kv * stride_kh
+        v_offset = off_z * stride_vm + off_h_kv * stride_vh
         o_offset = off_z * stride_om + off_h * stride_oh
         c_offset = off_z * stride_cz + off_h * stride_ch
 
@@ -393,8 +400,8 @@ if TRITON_AVAILABLE:
         if HAS_POS_MASK:
             dk += dk_unrot
 
-        tl.store(dk_ptrs, dk.to(Q.dtype.element_ty), mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL))
-        tl.store(dv_ptrs, dv.to(Q.dtype.element_ty), mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL))
+        tl.atomic_add(dk_ptrs, dk.to(Q.dtype.element_ty), mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL))
+        tl.atomic_add(dv_ptrs, dv.to(Q.dtype.element_ty), mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL))
 else:
     _flash_rotary_fwd_kernel = _dummy_kernel
     _flash_rotary_bwd_kernel = _dummy_kernel
@@ -412,8 +419,8 @@ class FlashAttentionFused(torch.autograd.Function):
         is_causal = True
     ):
         device, dtype = q.device, q.dtype
-        batch, heads, seq_len_q, dim = q.shape
-        _, _, seq_len_k, _ = k.shape
+        batch, heads_q, seq_len_q, dim = q.shape
+        _, heads_kv, seq_len_k, _ = k.shape
 
         sm_scale = dim ** -0.5
 
@@ -428,13 +435,13 @@ class FlashAttentionFused(torch.autograd.Function):
         # output buffers
 
         out = torch.empty_like(q)
-        lse = torch.empty((batch, heads, seq_len_q), device = device, dtype = torch.float32)
+        lse = torch.empty((batch, heads_q, seq_len_q), device = device, dtype = torch.float32)
 
         # triton kernel config
 
         grid = lambda META: (
             triton.cdiv(seq_len_q, META['BLOCK_M']),
-            batch * heads,
+            batch * heads_q,
             1
         )
 
@@ -467,7 +474,7 @@ class FlashAttentionFused(torch.autograd.Function):
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             stride_cz, stride_ch, stride_cn, stride_ck,
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            batch, heads, seq_len_q, seq_len_k,
+            batch, heads_q, heads_kv, seq_len_q, seq_len_k,
             BLOCK_DMODEL=dim,
             ROTARY_DIM=cos.shape[-1],
             IS_CAUSAL=is_causal,
@@ -487,15 +494,15 @@ class FlashAttentionFused(torch.autograd.Function):
         q, k, v, out, lse, cos, sin, pos_mask, attn_mask = ctx.saved_tensors
 
         dq = torch.zeros_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
 
-        batch, heads, seq_len_q, dim = q.shape
-        _, _, seq_len_k, _ = k.shape
+        batch, heads_q, seq_len_q, dim = q.shape
+        _, heads_kv, seq_len_k, _ = k.shape
 
         grid = lambda META: (
             triton.cdiv(seq_len_k, META['BLOCK_N']),
-            batch * heads,
+            batch * heads_q,
             1
         )
 
@@ -521,7 +528,7 @@ class FlashAttentionFused(torch.autograd.Function):
             stride_cz, stride_ch, stride_cn, stride_ck,
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
-            batch, heads, seq_len_q, seq_len_k,
+            batch, heads_q, heads_kv, seq_len_q, seq_len_k,
             BLOCK_DMODEL=dim,
             ROTARY_DIM=cos.shape[-1],
             IS_CAUSAL=ctx.is_causal,
@@ -544,8 +551,8 @@ def get_flash_attention_fused(force_reference = False):
         rotary_pos_emb_indices = None
     ):
         device, dtype = q.device, q.dtype
-        batch, heads, seq_len_q, dim = q.shape
-        _, _, seq_len_k, _ = k.shape
+        batch, heads_q, seq_len_q, dim = q.shape
+        _, heads_kv, seq_len_k, _ = k.shape
 
         # handle rotary positional embeddings natively
 
@@ -577,7 +584,7 @@ def get_flash_attention_fused(force_reference = False):
                 attn_mask = attn_mask_float
 
             attn_mask = rearrange(attn_mask, 'b j -> b 1 1 j') if attn_mask.ndim == 2 else rearrange(attn_mask, 'b i j -> b 1 i j')
-            attn_mask = attn_mask.expand(batch, heads, seq_len_q, seq_len_k)
+            attn_mask = attn_mask.expand(batch, heads_q, seq_len_q, seq_len_k)
 
         # dispatch to reference if requested or triton unavailable
 

@@ -150,13 +150,13 @@ from rotary_embedding_torch import RotaryEmbedding
 from rotary_embedding_torch.flash_attn_with_rotary import flash_attn_with_rotary
 
 rotary_emb = RotaryEmbedding(dim = 32)
-freqs = rotary_emb.forward(torch.arange(1024))
+freqs = rotary_emb(torch.arange(1024))
 
-q = torch.randn(1, 8, 1026, 64).cuda() # 2 extra tokens (e.g. CLS, register)
-k = torch.randn(1, 8, 1026, 64).cuda()
-v = torch.randn(1, 8, 1026, 64).cuda()
+q = torch.randn(1, 8, 1024 + 2, 64).cuda() # 2 extra tokens (e.g. CLS, register)
+k = torch.randn(1, 8, 1024 + 2, 64).cuda()
+v = torch.randn(1, 8, 1024 + 2, 64).cuda()
 
-# Indices for the 1024 rotary positions, skipping the first 2 tokens (CLS / register)
+# indices for the 1024 rotary positions, skipping the first 2 tokens (CLS / register)
 pos_indices = torch.arange(1024).cuda() + 2
 
 # fused flash attention with rotary

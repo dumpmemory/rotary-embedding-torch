@@ -1,6 +1,6 @@
 [project]
 name = "rotary-embedding-torch"
-version = "0.9.0"
+version = "0.9.1"
 description = "Rotary Embedding - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
