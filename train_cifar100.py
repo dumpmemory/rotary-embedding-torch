@@ -1,12 +1,10 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.10"
 # dependencies = [
-#     "torch==2.3.1",
-#     "torchvision==0.18.1",
+#     "torchvision",
 #     "accelerate",
 #     "x-transformers",
 #     "einops",
-#     "triton",
 #     "fire"
 # ]
 # ///

@@ -40,20 +40,20 @@ def reference_flash_attention(
     # attention similarity
 
     sim = torch.einsum('b h i d, b h j d -> b h i j', q, k)
-    
+
     # rotary embeddings
 
     if exists(cos) and exists(sin):
         rot_dim = cos.shape[-1]
-        
+
         q_rot = (q[..., :rot_dim] * cos) + (rotate_half(q[..., :rot_dim]) * sin)
         k_rot = (k[..., :rot_dim] * cos) + (rotate_half(k[..., :rot_dim]) * sin)
 
         q_rot = cat((q_rot, q[..., rot_dim:]), dim = -1)
         k_rot = cat((k_rot, k[..., rot_dim:]), dim = -1)
-        
+
         sim_rot = torch.einsum('b h i d, b h j d -> b h i j', q_rot, k_rot)
-        
+
         # apply positional mask if provided
 
         if exists(pos_mask):
@@ -61,18 +61,18 @@ def reference_flash_attention(
             sim = torch.where(is_pos_2d, sim_rot, sim)
         else:
             sim = sim_rot
-        
+
     sim = sim * (dim ** -0.5)
 
     # masks
 
     if exists(attn_mask):
         sim = sim + attn_mask
-        
+
     if is_causal:
         causal_mask = torch.ones((seq_len_q, seq_len_k), device = device, dtype = torch.bool).tril()
         sim = torch.where(causal_mask, sim, float('-inf'))
-    
+
     # aggregate values
 
     attn = sim.softmax(dim = -1)
@@ -114,61 +114,61 @@ if TRITON_AVAILABLE:
     ):
         start_m = tl.program_id(0)
         off_hz = tl.program_id(1)
-        
+
         off_z = off_hz // heads
         off_h = off_hz % heads
-        
+
         q_offset = off_z * stride_qm + off_h * stride_qh
         k_offset = off_z * stride_km + off_h * stride_kh
         v_offset = off_z * stride_vm + off_h * stride_vh
         c_offset = off_z * stride_cz + off_h * stride_ch
-        
+
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
-        
+
         q_ptrs = Q + q_offset + offs_m[:, None] * stride_qn + offs_k[None, :] * stride_qk
         q = tl.load(q_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL), other=0.0)
-        
+
         offs_k_swapped = offs_k ^ 1
         rot_sign = ((offs_k % 2) * 2 - 1)
-        
+
         q_swapped_ptrs = Q + q_offset + offs_m[:, None] * stride_qn + offs_k_swapped[None, :] * stride_qk
         q_swapped = tl.load(q_swapped_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL), other=0.0)
-        
+
         cos_q_ptrs = Cos + c_offset + offs_m[:, None] * stride_cn + offs_k[None, :] * stride_ck
         sin_q_ptrs = Sin + c_offset + offs_m[:, None] * stride_cn + offs_k[None, :] * stride_ck
         cos_q = tl.load(cos_q_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < ROTARY_DIM), other=1.0)
         sin_q = tl.load(sin_q_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < ROTARY_DIM), other=0.0)
-        
+
         q_rot = q * cos_q + q_swapped * rot_sign[None, :] * sin_q
-        
+
         if HAS_POS_MASK:
             pos_m_ptrs = PosMask + offs_m
             pos_m = tl.load(pos_m_ptrs, mask=offs_m < N_CTX_Q, other=0).to(tl.int1)
-        
+
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-        
+
         for start_n in range(0, N_CTX_K, BLOCK_N):
             offs_n_curr = start_n + offs_n
-            
+
             k_ptrs = K + k_offset + offs_n_curr[None, :] * stride_kn + offs_k[:, None] * stride_kk
             k = tl.load(k_ptrs, mask=(offs_n_curr[None, :] < N_CTX_K) & (offs_k[:, None] < BLOCK_DMODEL), other=0.0)
-            
+
             k_swapped_ptrs = K + k_offset + offs_n_curr[None, :] * stride_kn + offs_k_swapped[:, None] * stride_kk
             k_swapped = tl.load(k_swapped_ptrs, mask=(offs_n_curr[None, :] < N_CTX_K) & (offs_k[:, None] < BLOCK_DMODEL), other=0.0)
-            
+
             cos_k_ptrs = Cos + c_offset + offs_n_curr[None, :] * stride_cn + offs_k[:, None] * stride_ck
             sin_k_ptrs = Sin + c_offset + offs_n_curr[None, :] * stride_cn + offs_k[:, None] * stride_ck
             cos_k = tl.load(cos_k_ptrs, mask=(offs_n_curr[None, :] < N_CTX_K) & (offs_k[:, None] < ROTARY_DIM), other=1.0)
             sin_k = tl.load(sin_k_ptrs, mask=(offs_n_curr[None, :] < N_CTX_K) & (offs_k[:, None] < ROTARY_DIM), other=0.0)
-            
+
             k_rot = k * cos_k + k_swapped * rot_sign[:, None] * sin_k
-            
+
             sim_rot = tl.dot(q_rot, k_rot, allow_tf32=False) * sm_scale
-            
+
             if HAS_POS_MASK:
                 sim_unrot = tl.dot(q, k, allow_tf32=False) * sm_scale
                 pos_k_ptrs = PosMask + offs_n_curr
@@ -177,18 +177,18 @@ if TRITON_AVAILABLE:
                 sim = tl.where(is_both, sim_rot, sim_unrot)
             else:
                 sim = sim_rot
-                
+
             if HAS_ATTN_MASK:
                 attn_mask_ptrs = AttnMask + off_z * stride_ab + off_h * stride_ah + offs_m[:, None] * stride_am + offs_n_curr[None, :] * stride_an
                 attn_mask_val = tl.load(attn_mask_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_n_curr[None, :] < N_CTX_K), other=float("-inf"))
                 sim += attn_mask_val
-                
+
             if IS_CAUSAL:
                 causal_mask = offs_m[:, None] >= offs_n_curr[None, :]
                 sim = tl.where(causal_mask, sim, float("-inf"))
-                
+
             sim = tl.where(offs_n_curr[None, :] < N_CTX_K, sim, float("-inf"))
-            
+
             m_ij = tl.maximum(m_i, tl.max(sim, 1))
             p = tl.math.exp(sim - m_ij[:, None])
             p = tl.where(sim == float("-inf"), 0.0, p)
@@ -197,19 +197,19 @@ if TRITON_AVAILABLE:
             alpha = tl.where(m_i == float("-inf"), 0.0, alpha)
             l_i = l_i * alpha + l_ij
             acc = acc * alpha[:, None]
-            
+
             v_ptrs = V + v_offset + offs_n_curr[:, None] * stride_vn + offs_k[None, :] * stride_vk
             v = tl.load(v_ptrs, mask=(offs_n_curr[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL), other=0.0)
             acc += tl.dot(p.to(V.dtype.element_ty), v, allow_tf32=False)
             m_i = m_ij
-            
+
         l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
         acc = acc / l_i_safe[:, None]
-        
+
         # write back lse
         lse_ptrs = Lse + off_hz * N_CTX_Q + offs_m
         tl.store(lse_ptrs, m_i + tl.math.log(l_i_safe), mask=offs_m < N_CTX_Q)
-        
+
         out_offset = off_z * stride_om + off_h * stride_oh
         out_ptrs = Out + out_offset + offs_m[:, None] * stride_on + offs_k[None, :] * stride_ok
         tl.store(out_ptrs, acc.to(Q.dtype.element_ty), mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL))
@@ -253,7 +253,7 @@ if TRITON_AVAILABLE:
 
         offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
-        
+
         q_offset = off_z * stride_qm + off_h * stride_qh
         k_offset = off_z * stride_km + off_h * stride_kh
         v_offset = off_z * stride_vm + off_h * stride_vh
@@ -270,13 +270,13 @@ if TRITON_AVAILABLE:
 
         offs_k_swapped = offs_k ^ 1
         rot_sign = ((offs_k % 2) * 2 - 1)
-        
+
         k_swapped_ptrs = K + k_offset + offs_n[:, None] * stride_kn + offs_k_swapped[None, :] * stride_kk
         k_swapped = tl.load(k_swapped_ptrs, mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL), other=0.0)
 
         cos_k_ptrs = Cos + c_offset + offs_n[:, None] * stride_cn + offs_k[None, :] * stride_ck
         sin_k_ptrs = Sin + c_offset + offs_n[:, None] * stride_cn + offs_k[None, :] * stride_ck
-        
+
         cos_k = tl.load(cos_k_ptrs, mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < ROTARY_DIM), other=1.0)
         sin_k = tl.load(sin_k_ptrs, mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < ROTARY_DIM), other=0.0)
 
@@ -312,7 +312,7 @@ if TRITON_AVAILABLE:
             q = tl.load(q_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL), other=0.0)
             q_swapped_ptrs = Q + q_offset + offs_m[:, None] * stride_qn + offs_k_swapped[None, :] * stride_qk
             q_swapped = tl.load(q_swapped_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL), other=0.0)
-            
+
             cos_q_ptrs = Cos + c_offset + offs_m[:, None] * stride_cn + offs_k[None, :] * stride_ck
             sin_q_ptrs = Sin + c_offset + offs_m[:, None] * stride_cn + offs_k[None, :] * stride_ck
             cos_q = tl.load(cos_q_ptrs, mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < ROTARY_DIM), other=1.0)
@@ -362,25 +362,25 @@ if TRITON_AVAILABLE:
                 is_both_f32 = tl.where(is_both, 1.0, 0.0)
                 ds_rot = ds * is_both_f32
                 ds_unrot = ds * (1.0 - is_both_f32)
-                
+
                 dk_rot += tl.dot(tl.trans(ds_rot.to(Q.dtype.element_ty)), q_rot, allow_tf32=False) * sm_scale
                 dk_rot_swapped += tl.dot(tl.trans(ds_rot.to(Q.dtype.element_ty)), q_rot_swapped, allow_tf32=False) * sm_scale
                 dk_unrot += tl.dot(tl.trans(ds_unrot.to(Q.dtype.element_ty)), q, allow_tf32=False) * sm_scale
-                
+
                 dq_rot_chunk = tl.dot(ds_rot.to(K.dtype.element_ty), k_rot, allow_tf32=False) * sm_scale
                 dq_rot_chunk_swapped = tl.dot(ds_rot.to(K.dtype.element_ty), k_rot_swapped, allow_tf32=False) * sm_scale
                 dq_chunk = dq_rot_chunk * cos_q - dq_rot_chunk_swapped * rot_sign[None, :] * sin_q
-                
+
                 dq_unrot_chunk = tl.dot(ds_unrot.to(K.dtype.element_ty), k, allow_tf32=False) * sm_scale
                 dq_chunk += dq_unrot_chunk
             else:
                 dk_rot += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q_rot, allow_tf32=False) * sm_scale
                 dk_rot_swapped += tl.dot(tl.trans(ds.to(Q.dtype.element_ty)), q_rot_swapped, allow_tf32=False) * sm_scale
-                
+
                 dq_rot_chunk = tl.dot(ds.to(K.dtype.element_ty), k_rot, allow_tf32=False) * sm_scale
                 dq_rot_chunk_swapped = tl.dot(ds.to(K.dtype.element_ty), k_rot_swapped, allow_tf32=False) * sm_scale
                 dq_chunk = dq_rot_chunk * cos_q - dq_rot_chunk_swapped * rot_sign[None, :] * sin_q
-                
+
             tl.atomic_add(dq_ptrs, dq_chunk.to(DQ.dtype.element_ty), mask=(offs_m[:, None] < N_CTX_Q) & (offs_k[None, :] < BLOCK_DMODEL))
 
             q_ptrs += BLOCK_M * stride_qn
@@ -392,7 +392,7 @@ if TRITON_AVAILABLE:
         dk = dk_rot * cos_k - dk_rot_swapped * rot_sign[None, :] * sin_k
         if HAS_POS_MASK:
             dk += dk_unrot
-            
+
         tl.store(dk_ptrs, dk.to(Q.dtype.element_ty), mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL))
         tl.store(dv_ptrs, dv.to(Q.dtype.element_ty), mask=(offs_n[:, None] < N_CTX_K) & (offs_k[None, :] < BLOCK_DMODEL))
 else:
@@ -414,7 +414,7 @@ class FlashAttentionFused(torch.autograd.Function):
         device, dtype = q.device, q.dtype
         batch, heads, seq_len_q, dim = q.shape
         _, _, seq_len_k, _ = k.shape
-        
+
         sm_scale = dim ** -0.5
 
         # contiguous
@@ -451,7 +451,7 @@ class FlashAttentionFused(torch.autograd.Function):
 
         has_attn_mask = exists(attn_mask)
         stride_ab = stride_ah = stride_am = stride_an = 0
-        
+
         if has_attn_mask:
             attn_mask = attn_mask.contiguous()
             stride_ab, stride_ah, stride_am, stride_an = attn_mask.stride()
@@ -485,29 +485,29 @@ class FlashAttentionFused(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         q, k, v, out, lse, cos, sin, pos_mask, attn_mask = ctx.saved_tensors
-        
+
         dq = torch.zeros_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        
+
         batch, heads, seq_len_q, dim = q.shape
         _, _, seq_len_k, _ = k.shape
-        
+
         grid = lambda META: (
             triton.cdiv(seq_len_k, META['BLOCK_N']),
             batch * heads,
             1
         )
-        
+
         stride_cz = cos.stride(0) if cos.size(0) > 1 else 0
         stride_ch = cos.stride(1) if cos.size(1) > 1 else 0
         stride_cn = cos.stride(2)
         stride_ck = cos.stride(3)
-        
+
         stride_ab = stride_ah = stride_am = stride_an = 0
         if ctx.has_attn_mask:
             stride_ab, stride_ah, stride_am, stride_an = attn_mask.stride()
-            
+
         _flash_rotary_bwd_kernel[grid](
             q, k, v, ctx.sm_scale,
             cos, sin,
@@ -555,19 +555,19 @@ def get_flash_attention_fused(force_reference = False):
             if exists(rotary_pos_emb_indices):
                 if rotary_pos_emb.ndim > 2:
                     rotary_pos_emb = rearrange(rotary_pos_emb, '... d -> (...) d')
-                
+
                 padded_freqs = torch.zeros((seq_len_q, rotary_pos_emb.shape[-1]), device = device, dtype = dtype)
                 padded_freqs[rotary_pos_emb_indices] = rotary_pos_emb
                 rotary_pos_emb = padded_freqs
-                
+
                 pos_mask = torch.zeros(seq_len_q, device = device, dtype = torch.bool)
                 pos_mask[rotary_pos_emb_indices] = True
-                
+
             cos = rearrange(rotary_pos_emb.cos(), '... n d -> ... 1 1 n d')
             sin = rearrange(rotary_pos_emb.sin(), '... n d -> ... 1 1 n d')
-            
+
         assert exists(cos) and exists(sin), 'either cos/sin or rotary_pos_emb must be provided'
-            
+
         # handle attention mask formatting
 
         if exists(attn_mask):
@@ -578,12 +578,12 @@ def get_flash_attention_fused(force_reference = False):
 
             attn_mask = rearrange(attn_mask, 'b j -> b 1 1 j') if attn_mask.ndim == 2 else rearrange(attn_mask, 'b i j -> b 1 i j')
             attn_mask = attn_mask.expand(batch, heads, seq_len_q, seq_len_k)
-            
+
         # dispatch to reference if requested or triton unavailable
 
         if force_reference or not TRITON_AVAILABLE:
             return reference_flash_attention(q, k, v, cos, sin, pos_mask, attn_mask, is_causal)
-            
+
         return FlashAttentionFused.apply(q, k, v, cos, sin, pos_mask, attn_mask, is_causal)
     return inner
 

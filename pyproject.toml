@@ -24,12 +24,11 @@ classifiers=[
 
 dependencies = [
     "einops>=0.8",
-    "torch>=2.0",
-    "torch-einops-utils>=0.1.4",
+    "torch>=2.4",
 ]
 
 [project.urls]
-Homepage = "https://github.com/lucidrains/rotary-embedding-torch"
+Homepage = "https://codeberg.og/lucidrains/rotary-embedding-torch"
 
 [project.optional-dependencies]
 test = [
@@ -55,4 +54,3 @@ include = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["rotary_embedding_torch"]
-
